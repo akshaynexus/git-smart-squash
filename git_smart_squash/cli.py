@@ -5,6 +5,7 @@ import sys
 import subprocess
 import json
 import os
+import time
 from typing import List, Dict, Any, Optional, Set
 from rich.console import Console
 from rich.panel import Panel
@@ -21,6 +22,8 @@ from .utils.commit_grouping import (
     build_hunk_assignment_prompt,
     COMMIT_GROUP_SCHEMA,
     HUNK_ASSIGNMENT_SCHEMA,
+    build_cluster_label_prompt,
+    CLUSTER_LABEL_SCHEMA,
 )
 from .hunk_applicator import apply_hunks_with_fallback, reset_staging_area
 from .logger import get_logger, LogLevel
@@ -399,7 +402,8 @@ class GitSmartSquashCLI:
                 hunks, custom_instructions, compare_info, commit_history
             )
 
-            response = ai_provider.generate(prompt)
+            cached = self._maybe_use_saved_response("hunk-plan")
+            response = cached if cached is not None else ai_provider.generate(prompt)
 
             # With structured output, response should be valid JSON
             result = json.loads(response)
@@ -425,6 +429,7 @@ class GitSmartSquashCLI:
 
         except json.JSONDecodeError as e:
             self.console.print(f"[red]AI returned invalid JSON: {e}[/red]")
+            self._save_ai_response("hunk-plan", response)
             return None
         except Exception as e:
             self.console.print(f"[red]AI analysis failed: {e}[/red]")
@@ -580,7 +585,11 @@ class GitSmartSquashCLI:
             return None
 
         group_infos = self._build_group_infos(validated_groups, commit_history)
-        assignments = self._assign_hunks_to_groups(hunks, group_infos, compare_info)
+        assignments, extra_groups = self._assign_hunks_to_groups(
+            hunks, group_infos, compare_info
+        )
+        if extra_groups:
+            group_infos.extend(extra_groups)
 
         commit_plan: List[Dict[str, Any]] = []
         for group in group_infos:
@@ -600,17 +609,24 @@ class GitSmartSquashCLI:
     def _group_commits_with_ai(self, commit_history: List[Dict[str, Any]]):
         prompt = build_commit_grouping_prompt(commit_history)
         ai_provider = UnifiedAIProvider(self.config)
-        response = ai_provider.generate_with_schema(prompt, COMMIT_GROUP_SCHEMA)
+        cached = self._maybe_use_saved_response("commit-grouping")
+        response = (
+            cached
+            if cached is not None
+            else ai_provider.generate_with_schema(prompt, COMMIT_GROUP_SCHEMA)
+        )
         try:
             result = json.loads(response)
         except json.JSONDecodeError as e:
             self.console.print(
                 f"[red]AI returned invalid JSON for commit grouping: {e}[/red]"
             )
+            self._save_ai_response("commit-grouping", response)
             return None
         groups = result.get("groups") if isinstance(result, dict) else None
         if not isinstance(groups, list):
             self.console.print("[red]Commit grouping response missing groups[/red]")
+            self._save_ai_response("commit-grouping", response)
             return None
         return groups
 
@@ -623,6 +639,8 @@ class GitSmartSquashCLI:
         normalized: List[Dict[str, Any]] = []
 
         for group in groups:
+            if not isinstance(group, dict):
+                continue
             hashes = group.get("commit_hashes") or []
             unique: List[str] = []
             for commit_hash in hashes:
@@ -656,6 +674,8 @@ class GitSmartSquashCLI:
         commit_map = {c.get("hash"): c for c in commit_history}
         enriched: List[Dict[str, Any]] = []
         for group in groups:
+            if not isinstance(group, dict):
+                continue
             files = set()
             subjects: List[str] = []
             for commit_hash in group.get("commit_hashes", []):
@@ -682,9 +702,15 @@ class GitSmartSquashCLI:
         hunks: List[Hunk],
         groups: List[Dict[str, Any]],
         compare_info: Optional[Dict[str, Any]],
-    ) -> Dict[str, List[str]]:
-        assignments: Dict[str, List[str]] = {g["name"]: [] for g in groups}
-        group_files = {g["name"]: set(g.get("files", [])) for g in groups}
+    ) -> tuple[Dict[str, List[str]], List[Dict[str, Any]]]:
+        assignments: Dict[str, List[str]] = {
+            g.get("name"): [] for g in groups if isinstance(g, dict) and g.get("name")
+        }
+        group_files = {
+            g.get("name"): set(g.get("files", []))
+            for g in groups
+            if isinstance(g, dict) and g.get("name")
+        }
 
         unassigned: List[Hunk] = []
         for hunk in hunks:
@@ -699,23 +725,178 @@ class GitSmartSquashCLI:
         if unassigned and self.config.ai.assignment_ai_enabled:
             prompt = build_hunk_assignment_prompt(groups, unassigned)
             ai_provider = UnifiedAIProvider(self.config)
-            response = ai_provider.generate_with_schema(prompt, HUNK_ASSIGNMENT_SCHEMA)
+            cached = self._maybe_use_saved_response("hunk-assignment")
+            response = (
+                cached
+                if cached is not None
+                else ai_provider.generate_with_schema(prompt, HUNK_ASSIGNMENT_SCHEMA)
+            )
             try:
                 result = json.loads(response)
             except json.JSONDecodeError as e:
                 self.console.print(
                     f"[red]AI returned invalid JSON for hunk assignment: {e}[/red]"
                 )
+                self._save_ai_response("hunk-assignment", response)
                 result = None
             if isinstance(result, dict):
                 for assignment in result.get("assignments", []):
+                    if not isinstance(assignment, dict):
+                        continue
                     group_name = assignment.get("group_name")
                     if group_name not in assignments:
                         continue
                     for hunk_id in assignment.get("hunk_ids", []) or []:
                         assignments[group_name].append(hunk_id)
 
-        return assignments
+        remaining = self._get_unassigned_hunks(hunks, assignments)
+        extra_groups: List[Dict[str, Any]] = []
+        if remaining:
+            ratio = len(remaining) / len(hunks) if hunks else 0
+            if ratio > 0.05:
+                extra_groups = self._cluster_unassigned_hunks(remaining, groups)
+                for group in extra_groups:
+                    group_name = group.get("name")
+                    if not group_name:
+                        continue
+                    assignments[group_name] = [h.id for h in group.get("hunks", [])]
+
+        return assignments, extra_groups
+
+    def _get_unassigned_hunks(
+        self, hunks: List[Hunk], assignments: Dict[str, List[str]]
+    ) -> List[Hunk]:
+        assigned = set()
+        for hunk_ids in assignments.values():
+            assigned.update(hunk_ids)
+        return [h for h in hunks if h.id not in assigned]
+
+    def _cluster_unassigned_hunks(
+        self, hunks: List[Hunk], groups: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        clusters: Dict[str, List[Hunk]] = {}
+        for hunk in hunks:
+            prefix = self._cluster_prefix(hunk.file_path)
+            clusters.setdefault(prefix, []).append(hunk)
+
+        summaries = []
+        for prefix, group_hunks in clusters.items():
+            sample_files = sorted({h.file_path for h in group_hunks})[:5]
+            summaries.append(
+                {
+                    "cluster": prefix,
+                    "hunks": len(group_hunks),
+                    "files": sample_files,
+                }
+            )
+
+        labels = self._label_clusters_with_ai(summaries, groups)
+        labeled = {
+            item.get("cluster"): item
+            for item in (labels or [])
+            if isinstance(item, dict)
+        }
+
+        groups: List[Dict[str, Any]] = []
+        for prefix, group_hunks in clusters.items():
+            label = labeled.get(prefix, {})
+            suggested = "chore({}): updates".format(prefix.replace("/", "-"))
+            description = "Unassigned hunks grouped by path"
+            if isinstance(label, dict):
+                suggested = label.get("suggested_message", suggested)
+                description = label.get("description", description)
+            groups.append(
+                {
+                    "name": prefix,
+                    "description": description,
+                    "suggested_message": suggested,
+                    "hunks": group_hunks,
+                }
+            )
+
+        return groups
+
+    def _label_clusters_with_ai(
+        self, summaries: List[Dict[str, Any]], groups: List[Dict[str, Any]]
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not summaries:
+            return None
+        prompt = build_cluster_label_prompt(summaries, groups)
+        ai_provider = UnifiedAIProvider(self.config)
+        cached = self._maybe_use_saved_response("cluster-labels")
+        response = (
+            cached
+            if cached is not None
+            else ai_provider.generate_with_schema(prompt, CLUSTER_LABEL_SCHEMA)
+        )
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError as e:
+            self.console.print(
+                f"[red]AI returned invalid JSON for cluster labels: {e}[/red]"
+            )
+            self._save_ai_response("cluster-labels", response)
+            return None
+        clusters = result.get("clusters") if isinstance(result, dict) else None
+        if not isinstance(clusters, list):
+            self.console.print("[red]Cluster label response missing clusters[/red]")
+            self._save_ai_response("cluster-labels", response)
+            return None
+        return clusters
+
+    def _cluster_prefix(self, file_path: str) -> str:
+        parts = [p for p in file_path.split("/") if p]
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        if parts:
+            return parts[0]
+        return "root"
+
+    def _maybe_use_saved_response(self, stage: str) -> Optional[str]:
+        saved_path = self._get_latest_saved_response(stage)
+        if not saved_path:
+            return None
+        self.console.print(
+            f"[yellow]Found saved AI response for {stage}: {saved_path}[/yellow]"
+        )
+        use_saved = input("Use this saved response instead of calling AI? (y/N): ")
+        if use_saved.lower().strip() == "y":
+            try:
+                with open(saved_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                self.console.print(f"[red]Failed to read saved response: {e}[/red]")
+        return None
+
+    def _get_latest_saved_response(self, stage: str) -> Optional[str]:
+        base_dir = os.path.join("/tmp", "git-smart-squash", "ai-responses")
+        if not os.path.isdir(base_dir):
+            return None
+        prefix = f"{stage}-"
+        candidates = [
+            os.path.join(base_dir, name)
+            for name in os.listdir(base_dir)
+            if name.startswith(prefix)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: os.path.getmtime(path))
+
+    def _save_ai_response(self, stage: str, response: str) -> Optional[str]:
+        try:
+            base_dir = os.path.join("/tmp", "git-smart-squash", "ai-responses")
+            os.makedirs(base_dir, exist_ok=True)
+            timestamp = int(time.time())
+            path = os.path.join(base_dir, f"{stage}-{timestamp}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(response)
+            self.console.print(
+                f"[yellow]Saved AI response for {stage} to {path}[/yellow]"
+            )
+            return path
+        except Exception as e:
+            self.console.print(f"[red]Failed to save AI response: {e}[/red]")
+            return None
 
     def _display_commit_history_summary(
         self, commit_history: Optional[List[Dict[str, Any]]]

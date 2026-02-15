@@ -54,6 +54,27 @@ HUNK_ASSIGNMENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+CLUSTER_LABEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clusters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "suggested_message": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["cluster", "suggested_message", "description"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["clusters"],
+    "additionalProperties": False,
+}
+
 
 def build_commit_grouping_prompt(commit_history: List[Dict[str, object]]) -> str:
     commits_serialized = []
@@ -159,6 +180,51 @@ def build_hunk_assignment_prompt(
             "    {",
             '      "group_name": "Group Name",',
             '      "hunk_ids": ["file.ts:10-20", "file.ts:33-40"]',
+            "    }",
+            "  ]",
+            "}",
+        ]
+    )
+
+
+def build_cluster_label_prompt(
+    cluster_summaries: List[Dict[str, object]],
+    existing_groups: List[Dict[str, object]] | None = None,
+) -> str:
+    existing_serialized = []
+    if existing_groups:
+        for group in existing_groups:
+            if not isinstance(group, dict):
+                continue
+            existing_serialized.append(
+                {
+                    "name": group.get("name"),
+                    "description": group.get("description"),
+                    "suggested_message": group.get("suggested_message"),
+                    "files": group.get("files"),
+                    "subjects": group.get("subjects"),
+                }
+            )
+    return "\n".join(
+        [
+            "You are labeling unassigned code change clusters for PR-ready commits.",
+            "Each cluster represents hunks from the same area; produce a concise PR-ready",
+            "conventional commit message (prefer feat/fix) and a short description.",
+            "Use existing grouped themes for consistency when they match.",
+            "",
+            "EXISTING GROUPS:",
+            str(existing_serialized),
+            "",
+            "CLUSTERS:",
+            str(cluster_summaries),
+            "",
+            "Return JSON only:",
+            "{",
+            '  "clusters": [',
+            "    {",
+            '      "cluster": "src/telegram",',
+            '      "suggested_message": "feat(telegram): <summary>",',
+            '      "description": "Short rationale"',
             "    }",
             "  ]",
             "}",
