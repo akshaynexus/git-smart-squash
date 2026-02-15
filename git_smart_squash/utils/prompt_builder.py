@@ -8,6 +8,7 @@ def build_hunk_prompt(
     hunks: List[Hunk],
     custom_instructions: Optional[str] = None,
     compare_info: Optional[Dict[str, Any]] = None,
+    commit_history: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     parts = [
         "Analyze these code changes and organize them into logical commits for pull request review.",
@@ -40,6 +41,22 @@ def build_hunk_prompt(
             )
         parts.append("")
 
+    if commit_history:
+        parts.append("COMMIT HISTORY (base..HEAD, oldest to newest):")
+        for commit in commit_history:
+            commit_hash = str(commit.get("hash", ""))
+            subject = str(commit.get("subject", ""))
+            body = str(commit.get("body", "")).strip()
+            files = commit.get("files", [])
+            parts.append(f"- {commit_hash[:7]} {subject}")
+            if body:
+                parts.append("  Body:")
+                for line in body.split("\n"):
+                    parts.append(f"    {line}")
+            if isinstance(files, list) and files:
+                parts.append(f"  Files: {', '.join(files)}")
+        parts.append("")
+
     parts.extend(
         [
             "For each commit, provide:",
@@ -56,6 +73,8 @@ def build_hunk_prompt(
             "- Avoid single-hunk commits unless the change is isolated or risky",
             "- Keep formatting-only changes separate unless they are required for the feature",
             "- Prefer grouping tests with the feature they validate, unless large",
+            "- Use the commit history to preserve intent and sequencing",
+            "- Do NOT drop hunks; if unsure, include them in a final catch-all commit",
             "",
             "Return your response in this exact structure:",
             "{",

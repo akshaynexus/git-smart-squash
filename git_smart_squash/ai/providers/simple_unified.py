@@ -15,7 +15,7 @@ class UnifiedAIProvider:
     PROVIDER_MAX_CONTEXT_TOKENS = {
         "local": 32000,  # Ollama hard maximum
         "openai": 400000,  # OpenAI GPT-5 only (400k tokens)
-        "openrouter": 200000,  # OpenRouter varies by model
+        "openrouter": 2000000,  # OpenRouter varies by model (up to 2M tokens)
         "gemini": 1000000,  # Gemini hard maximum (1M tokens)
         "anthropic": 200000,  # Anthropic hard maximum (200k tokens)
     }
@@ -125,6 +125,13 @@ class UnifiedAIProvider:
         provider_limit = self.PROVIDER_MAX_CONTEXT_TOKENS.get(
             self.provider_type, self.DEFAULT_MAX_CONTEXT_TOKENS
         )
+
+        warn_threshold = int(provider_limit * 0.85)
+        if prompt_tokens > warn_threshold:
+            percent = (prompt_tokens / provider_limit) * 100
+            logger.warning(
+                f"Prompt size {prompt_tokens} tokens is {percent:.1f}% of the {self.provider_type} context limit ({provider_limit})."
+            )
 
         # Check if prompt exceeds our maximum supported context
         if prompt_tokens > provider_limit - 2000:  # Reserve 2000 for response

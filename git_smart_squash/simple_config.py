@@ -20,6 +20,8 @@ class AIConfig:
     )
     include_branch_context: bool = True
     max_commit_context: int = 20
+    include_commit_history: bool = True
+    max_commit_history: Optional[int] = None
 
 
 @dataclass
@@ -27,8 +29,8 @@ class HunkConfig:
     """Hunk-based grouping configuration."""
 
     show_hunk_context: bool = True
-    context_lines: int = 3
-    max_hunks_per_prompt: int = 1000
+    context_lines: int = 8
+    max_hunks_per_prompt: Optional[int] = None
 
 
 @dataclass
@@ -112,14 +114,18 @@ class ConfigManager:
                 "include_branch_context", True
             ),
             max_commit_context=config_data.get("ai", {}).get("max_commit_context", 20),
+            include_commit_history=config_data.get("ai", {}).get(
+                "include_commit_history", True
+            ),
+            max_commit_history=config_data.get("ai", {}).get("max_commit_history"),
         )
 
         # Load hunk configuration
         hunk_config_data = config_data.get("hunks", {})
         hunk_config = HunkConfig(
             show_hunk_context=hunk_config_data.get("show_hunk_context", True),
-            context_lines=hunk_config_data.get("context_lines", 3),
-            max_hunks_per_prompt=hunk_config_data.get("max_hunks_per_prompt", 1000),
+            context_lines=hunk_config_data.get("context_lines", 8),
+            max_hunks_per_prompt=hunk_config_data.get("max_hunks_per_prompt"),
         )
 
         # Load attribution configuration
@@ -151,11 +157,13 @@ class ConfigManager:
                 "api_key_env": None,
                 "include_branch_context": True,
                 "max_commit_context": 20,
+                "include_commit_history": True,
+                "max_commit_history": None,
             },
             "hunks": {
                 "show_hunk_context": True,
-                "context_lines": 3,
-                "max_hunks_per_prompt": 1000,
+                "context_lines": 8,
+                "max_hunks_per_prompt": None,
             },
             "attribution": {"enabled": True},
             "auto_apply": False,

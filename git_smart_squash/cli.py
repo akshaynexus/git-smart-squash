@@ -15,6 +15,7 @@ from .ai.providers.simple_unified import UnifiedAIProvider
 from .diff_parser import parse_diff, Hunk
 from .utils.git_diff import get_full_diff as util_get_full_diff
 from .utils.git_compare import get_branch_compare
+from .utils.git_history import get_commit_history
 from .hunk_applicator import apply_hunks_with_fallback, reset_staging_area
 from .logger import get_logger, LogLevel
 from .dependency_validator import DependencyValidator, ValidationResult
@@ -173,6 +174,19 @@ class GitSmartSquashCLI:
                 except Exception as e:
                     self.logger.debug(f"Branch comparison failed: {e}")
 
+            commit_history = None
+            if self.config.ai.include_commit_history:
+                try:
+                    commit_history = get_commit_history(args.base)
+                    max_history = self.config.ai.max_commit_history
+                    if isinstance(max_history, int) and max_history > 0:
+                        commit_history = commit_history[-max_history:]
+                    if commit_history:
+                        commit_history = list(reversed(commit_history))
+                    self._display_commit_history_summary(commit_history)
+                except Exception as e:
+                    self.logger.debug(f"Commit history fetch failed: {e}")
+
             # 1.5. Working directory pre-check: show guidance if dirty, but continue to analysis.
             # Final safety check happens again before any apply.
             status_info = self._check_working_directory_clean()
@@ -199,18 +213,27 @@ class GitSmartSquashCLI:
                 )
 
                 # Check if we have too many hunks for the AI to process
-                if len(hunks) > self.config.hunks.max_hunks_per_prompt:
+                max_hunks = self.config.hunks.max_hunks_per_prompt
+                if (
+                    isinstance(max_hunks, int)
+                    and max_hunks > 0
+                    and len(hunks) > max_hunks
+                ):
                     self.console.print(
-                        f"[yellow]Warning: {len(hunks)} hunks found, limiting to {self.config.hunks.max_hunks_per_prompt} for AI analysis[/yellow]"
+                        f"[yellow]Warning: {len(hunks)} hunks found, limiting to {max_hunks} for AI analysis[/yellow]"
                     )
-                    hunks = hunks[: self.config.hunks.max_hunks_per_prompt]
+                    hunks = hunks[:max_hunks]
 
                 # 3. Send hunks to AI for commit organization
                 progress.update(task, description="Analyzing changes with AI...")
                 # Use custom instructions from CLI args, or fall back to config
                 custom_instructions = args.instructions or self.config.ai.instructions
                 commit_plan = self.analyze_with_ai(
-                    hunks, full_diff, custom_instructions, compare_info
+                    hunks,
+                    full_diff,
+                    custom_instructions,
+                    compare_info,
+                    commit_history,
                 )
 
             if not commit_plan:
@@ -322,6 +345,7 @@ class GitSmartSquashCLI:
         full_diff: str,
         custom_instructions: Optional[str] = None,
         compare_info: Optional[Dict[str, Any]] = None,
+        commit_history: Optional[List[Dict[str, Any]]] = None,
     ):
         """Send hunks to AI and get back commit organization plan (as a list)."""
         try:
@@ -332,7 +356,9 @@ class GitSmartSquashCLI:
             ai_provider = UnifiedAIProvider(self.config)
 
             # Build hunk-based prompt
-            prompt = self._build_hunk_prompt(hunks, custom_instructions, compare_info)
+            prompt = self._build_hunk_prompt(
+                hunks, custom_instructions, compare_info, commit_history
+            )
 
             response = ai_provider.generate(prompt)
 
@@ -370,10 +396,13 @@ class GitSmartSquashCLI:
         hunks: List[Hunk],
         custom_instructions: Optional[str] = None,
         compare_info: Optional[Dict[str, Any]] = None,
+        commit_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         from .utils.prompt_builder import build_hunk_prompt
 
-        return build_hunk_prompt(hunks, custom_instructions, compare_info)
+        return build_hunk_prompt(
+            hunks, custom_instructions, compare_info, commit_history
+        )
 
     def display_commit_plan(self, commit_plan):
         from .utils.display import display_commit_plan as _display
@@ -473,6 +502,15 @@ class GitSmartSquashCLI:
             self.console.print(
                 f"[yellow]Added {len(missing)} unassigned hunks to a final catch-all commit[/yellow]"
             )
+
+    def _display_commit_history_summary(
+        self, commit_history: Optional[List[Dict[str, Any]]]
+    ) -> None:
+        if not commit_history:
+            return
+        self.console.print(
+            f"[dim]Included {len(commit_history)} commits of history in the AI prompt[/dim]"
+        )
 
         # (removed duplicate implementation; commit application lives in strategies.commit_applier)
 
