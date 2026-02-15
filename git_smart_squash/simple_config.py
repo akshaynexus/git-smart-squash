@@ -25,6 +25,8 @@ class AIConfig:
     second_pass_enabled: bool = True
     second_pass_min_hunks: int = 20
     second_pass_min_ratio: float = 0.15
+    multi_stage_enabled: bool = True
+    assignment_ai_enabled: bool = True
 
 
 @dataclass
@@ -130,6 +132,12 @@ class ConfigManager:
             second_pass_min_ratio=config_data.get("ai", {}).get(
                 "second_pass_min_ratio", 0.15
             ),
+            multi_stage_enabled=config_data.get("ai", {}).get(
+                "multi_stage_enabled", True
+            ),
+            assignment_ai_enabled=config_data.get("ai", {}).get(
+                "assignment_ai_enabled", True
+            ),
         )
 
         # Load hunk configuration
@@ -174,6 +182,8 @@ class ConfigManager:
                 "second_pass_enabled": True,
                 "second_pass_min_hunks": 20,
                 "second_pass_min_ratio": 0.15,
+                "multi_stage_enabled": True,
+                "assignment_ai_enabled": True,
             },
             "hunks": {
                 "show_hunk_context": True,

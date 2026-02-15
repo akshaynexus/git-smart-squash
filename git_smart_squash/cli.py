@@ -16,6 +16,12 @@ from .diff_parser import parse_diff, Hunk
 from .utils.git_diff import get_full_diff as util_get_full_diff
 from .utils.git_compare import get_branch_compare
 from .utils.git_history import get_commit_history
+from .utils.commit_grouping import (
+    build_commit_grouping_prompt,
+    build_hunk_assignment_prompt,
+    COMMIT_GROUP_SCHEMA,
+    HUNK_ASSIGNMENT_SCHEMA,
+)
 from .hunk_applicator import apply_hunks_with_fallback, reset_staging_area
 from .logger import get_logger, LogLevel
 from .dependency_validator import DependencyValidator, ValidationResult
@@ -228,13 +234,20 @@ class GitSmartSquashCLI:
                 progress.update(task, description="Analyzing changes with AI...")
                 # Use custom instructions from CLI args, or fall back to config
                 custom_instructions = args.instructions or self.config.ai.instructions
-                commit_plan = self.analyze_with_ai(
-                    hunks,
-                    full_diff,
-                    custom_instructions,
-                    compare_info,
-                    commit_history,
-                )
+                if self.config.ai.multi_stage_enabled and commit_history:
+                    commit_plan = self._run_multi_stage_grouping(
+                        hunks,
+                        commit_history,
+                        compare_info,
+                    )
+                else:
+                    commit_plan = self.analyze_with_ai(
+                        hunks,
+                        full_diff,
+                        custom_instructions,
+                        compare_info,
+                        commit_history,
+                    )
 
             if not commit_plan:
                 self.console.print("[red]Failed to generate commit plan[/red]")
@@ -551,6 +564,158 @@ class GitSmartSquashCLI:
         if base_instructions:
             return f"{base_instructions}\n\n{extra}"
         return extra
+
+    def _run_multi_stage_grouping(
+        self,
+        hunks: List[Hunk],
+        commit_history: List[Dict[str, Any]],
+        compare_info: Optional[Dict[str, Any]],
+    ):
+        groups = self._group_commits_with_ai(commit_history)
+        if not groups:
+            return None
+
+        validated_groups = self._validate_commit_groups(groups, commit_history)
+        if not validated_groups:
+            return None
+
+        group_infos = self._build_group_infos(validated_groups, commit_history)
+        assignments = self._assign_hunks_to_groups(hunks, group_infos, compare_info)
+
+        commit_plan: List[Dict[str, Any]] = []
+        for group in group_infos:
+            hunk_ids = assignments.get(group["name"], [])
+            if not hunk_ids:
+                continue
+            commit_plan.append(
+                {
+                    "message": group["suggested_message"],
+                    "hunk_ids": hunk_ids,
+                    "rationale": group["description"],
+                }
+            )
+
+        return commit_plan
+
+    def _group_commits_with_ai(self, commit_history: List[Dict[str, Any]]):
+        prompt = build_commit_grouping_prompt(commit_history)
+        ai_provider = UnifiedAIProvider(self.config)
+        response = ai_provider.generate_with_schema(prompt, COMMIT_GROUP_SCHEMA)
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError as e:
+            self.console.print(
+                f"[red]AI returned invalid JSON for commit grouping: {e}[/red]"
+            )
+            return None
+        groups = result.get("groups") if isinstance(result, dict) else None
+        if not isinstance(groups, list):
+            self.console.print("[red]Commit grouping response missing groups[/red]")
+            return None
+        return groups
+
+    def _validate_commit_groups(
+        self, groups: List[Dict[str, Any]], commit_history: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        valid_hashes = [c.get("hash") for c in commit_history if c.get("hash")]
+        valid_set = set(valid_hashes)
+        seen = set()
+        normalized: List[Dict[str, Any]] = []
+
+        for group in groups:
+            hashes = group.get("commit_hashes") or []
+            unique: List[str] = []
+            for commit_hash in hashes:
+                if commit_hash not in valid_set:
+                    continue
+                if commit_hash in seen:
+                    continue
+                seen.add(commit_hash)
+                unique.append(commit_hash)
+            if unique:
+                new_group = dict(group)
+                new_group["commit_hashes"] = unique
+                normalized.append(new_group)
+
+        missing = [h for h in valid_hashes if h not in seen]
+        if missing:
+            normalized.append(
+                {
+                    "name": "Miscellaneous Changes",
+                    "description": "Commits not grouped by AI",
+                    "commit_hashes": missing,
+                    "suggested_message": "chore: miscellaneous updates",
+                }
+            )
+
+        return normalized
+
+    def _build_group_infos(
+        self, groups: List[Dict[str, Any]], commit_history: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        commit_map = {c.get("hash"): c for c in commit_history}
+        enriched: List[Dict[str, Any]] = []
+        for group in groups:
+            files = set()
+            subjects: List[str] = []
+            for commit_hash in group.get("commit_hashes", []):
+                commit = commit_map.get(commit_hash)
+                if not commit:
+                    continue
+                subjects.append(str(commit.get("subject", "")))
+                for file_path in commit.get("files", []) or []:
+                    files.add(file_path)
+            enriched.append(
+                {
+                    "name": group.get("name"),
+                    "description": group.get("description"),
+                    "suggested_message": group.get("suggested_message"),
+                    "commit_hashes": group.get("commit_hashes"),
+                    "files": sorted(files),
+                    "subjects": subjects,
+                }
+            )
+        return enriched
+
+    def _assign_hunks_to_groups(
+        self,
+        hunks: List[Hunk],
+        groups: List[Dict[str, Any]],
+        compare_info: Optional[Dict[str, Any]],
+    ) -> Dict[str, List[str]]:
+        assignments: Dict[str, List[str]] = {g["name"]: [] for g in groups}
+        group_files = {g["name"]: set(g.get("files", [])) for g in groups}
+
+        unassigned: List[Hunk] = []
+        for hunk in hunks:
+            candidates = [
+                name for name, files in group_files.items() if hunk.file_path in files
+            ]
+            if len(candidates) == 1:
+                assignments[candidates[0]].append(hunk.id)
+            else:
+                unassigned.append(hunk)
+
+        if unassigned and self.config.ai.assignment_ai_enabled:
+            prompt = build_hunk_assignment_prompt(groups, unassigned)
+            ai_provider = UnifiedAIProvider(self.config)
+            response = ai_provider.generate_with_schema(prompt, HUNK_ASSIGNMENT_SCHEMA)
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError as e:
+                self.console.print(
+                    f"[red]AI returned invalid JSON for hunk assignment: {e}[/red]"
+                )
+                result = None
+            if isinstance(result, dict):
+                for assignment in result.get("assignments", []):
+                    group_name = assignment.get("group_name")
+                    if group_name not in assignments:
+                        continue
+                    for hunk_id in assignment.get("hunk_ids", []) or []:
+                        assignments[group_name].append(hunk_id)
+
+        return assignments
 
     def _display_commit_history_summary(
         self, commit_history: Optional[List[Dict[str, Any]]]

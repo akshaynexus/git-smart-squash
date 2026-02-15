@@ -80,6 +80,7 @@ class UnifiedAIProvider:
             "anthropic": self._generate_anthropic,
             "gemini": self._generate_gemini,
         }
+        self._schema_override = None
 
     def _get_api_key(self, default_env: str) -> str:
         """Resolve API key using config override then provider defaults."""
@@ -91,6 +92,31 @@ class UnifiedAIProvider:
         if not api_key:
             raise Exception(f"{default_env} environment variable not set")
         return api_key
+
+    def _get_schema(self) -> dict:
+        return self._schema_override or self.COMMIT_SCHEMA
+
+    def _sanitize_schema_for_gemini(self, schema: dict) -> dict:
+        def _clean(node):
+            if isinstance(node, dict):
+                cleaned = {
+                    k: _clean(v) for k, v in node.items() if k != "additionalProperties"
+                }
+                return cleaned
+            if isinstance(node, list):
+                return [_clean(item) for item in node]
+            return node
+
+        return _clean(schema)
+
+    def generate_with_schema(self, prompt: str, schema: dict) -> str:
+        """Generate response using a custom JSON schema."""
+        previous = self._schema_override
+        self._schema_override = schema
+        try:
+            return self.generate(prompt)
+        finally:
+            self._schema_override = previous
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count using tiktoken for all providers."""
@@ -242,7 +268,7 @@ class UnifiedAIProvider:
                 "model": self.config.ai.model,
                 "prompt": full_prompt,
                 "stream": False,
-                "format": self.COMMIT_SCHEMA,  # Enforce JSON structure
+                "format": self._get_schema(),  # Enforce JSON structure
                 "options": {
                     "num_ctx": ollama_params["num_ctx"],
                     "num_predict": ollama_params["num_predict"],
@@ -382,7 +408,7 @@ class UnifiedAIProvider:
                     "format": {
                         "type": "json_schema",
                         "name": "commit_plan",
-                        "schema": self.COMMIT_SCHEMA,
+                        "schema": self._get_schema(),
                         "strict": True,
                     }
                 },
@@ -514,7 +540,7 @@ class UnifiedAIProvider:
                 {
                     "name": "commit_organizer",
                     "description": "Organize git commits into structured format",
-                    "input_schema": self.COMMIT_SCHEMA,
+                    "input_schema": self._get_schema(),
                 }
             ]
 
@@ -629,7 +655,9 @@ class UnifiedAIProvider:
                 "topP": 0.95,  # Higher top_p for better instruction following
                 "topK": 20,  # Lower top_k for more focused responses
                 "responseMimeType": "application/json",  # Force JSON output
-                "responseSchema": self.GEMINI_SCHEMA,  # Use Gemini-compatible schema
+                "responseSchema": self._sanitize_schema_for_gemini(
+                    self._get_schema()
+                ),  # Use Gemini-compatible schema
             }
 
             # Add thinking config only for models that support it
