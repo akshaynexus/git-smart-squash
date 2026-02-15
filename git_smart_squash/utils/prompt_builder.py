@@ -48,13 +48,30 @@ def build_hunk_prompt(
             subject = str(commit.get("subject", ""))
             body = str(commit.get("body", "")).strip()
             files = commit.get("files", [])
+            shortstat = str(commit.get("shortstat", "")).strip()
+            diffstat = str(commit.get("diffstat", "")).strip()
             parts.append(f"- {commit_hash[:7]} {subject}")
             if body:
                 parts.append("  Body:")
                 for line in body.split("\n"):
                     parts.append(f"    {line}")
+            if shortstat:
+                parts.append(f"  Stats: {shortstat}")
+            if diffstat:
+                parts.append("  Diffstat:")
+                for line in diffstat.split("\n"):
+                    parts.append(f"    {line}")
             if isinstance(files, list) and files:
                 parts.append(f"  Files: {', '.join(files)}")
+        parts.append("")
+
+    file_summary = {}
+    for hunk in hunks:
+        file_summary[hunk.file_path] = file_summary.get(hunk.file_path, 0) + 1
+    if file_summary:
+        parts.append("FILE SUMMARY (hunk counts):")
+        for file_path, count in sorted(file_summary.items()):
+            parts.append(f"- {file_path}: {count} hunk(s)")
         parts.append("")
 
     parts.extend(
@@ -63,18 +80,30 @@ def build_hunk_prompt(
             "1. A properly formatted git commit message following these rules:",
             "   - First line: max 80 characters (type: brief description)",
             "   - If more detail needed: empty line, then body with lines max 80 chars",
-            "   - Use conventional commit format: feat:, fix:, docs:, test:, refactor:, etc.",
+            "   - Use conventional commit format: type(scope)?: summary",
+            "   - Prefer feat/fix for product changes; use refactor/test/docs/chore only when appropriate",
+            "   - feat: state the user-facing feature added",
+            "   - fix: state the concrete bug/behavior fixed",
+            "   - Include a scope when clear (folder/module/component)",
+            "   - Messages must be PR-ready, concise, and specific",
+            "   - Body (if used) should explain why and key behavior changes",
             "2. The specific hunk IDs that should be included (not file paths!)",
             "3. A brief rationale for why these changes belong together",
             "",
             "REQUIREMENTS:",
             "- EVERY hunk must appear in EXACTLY one commit",
             "- Use ONLY the hunk IDs listed below; do not invent IDs",
+            "- Prefer 3-12 commits unless changes are tiny",
             "- Avoid single-hunk commits unless the change is isolated or risky",
             "- Keep formatting-only changes separate unless they are required for the feature",
             "- Prefer grouping tests with the feature they validate, unless large",
             "- Use the commit history to preserve intent and sequencing",
             "- Do NOT drop hunks; if unsure, include them in a final catch-all commit",
+            "",
+            "GROUPING STRATEGY:",
+            "1. Identify themes/modules from commit history + file summary",
+            "2. Assign every hunk to exactly one theme",
+            "3. Produce PR-ready commit messages for each theme",
             "",
             "Return your response in this exact structure:",
             "{",
@@ -106,6 +135,8 @@ def build_hunk_prompt(
                 f"Hunk ID: {hunk.id}",
                 f"File: {hunk.file_path}",
                 f"Context lines: {hunk.start_line}-{hunk.end_line}",
+                f"Change type: {hunk.change_type}",
+                f"Depends on: {', '.join(sorted(hunk.dependencies)) if hunk.dependencies else 'None'}",
                 "",
                 "Context:",
                 hunk.context

@@ -6,7 +6,9 @@ from ..diff_parser import Hunk
 
 
 def normalize_commit_plan(
-    commits: List[dict], hunks: List[Hunk]
+    commits: List[dict],
+    hunks: List[Hunk],
+    add_catch_all: bool = True,
 ) -> Tuple[List[dict], Dict[str, object]]:
     """Normalize commit plan by removing invalid/duplicate hunks and adding missing ones."""
     valid_ids = [h.id for h in hunks]
@@ -37,7 +39,7 @@ def normalize_commit_plan(
 
     missing = [hunk_id for hunk_id in valid_ids if hunk_id not in seen]
 
-    if missing:
+    if add_catch_all and missing:
         normalized.append(
             {
                 "message": "chore: remaining changes",

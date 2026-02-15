@@ -22,6 +22,9 @@ class AIConfig:
     max_commit_context: int = 20
     include_commit_history: bool = True
     max_commit_history: Optional[int] = None
+    second_pass_enabled: bool = True
+    second_pass_min_hunks: int = 20
+    second_pass_min_ratio: float = 0.15
 
 
 @dataclass
@@ -37,7 +40,7 @@ class HunkConfig:
 class AttributionConfig:
     """Attribution message configuration."""
 
-    enabled: bool = True
+    enabled: bool = False
 
 
 @dataclass
@@ -118,6 +121,15 @@ class ConfigManager:
                 "include_commit_history", True
             ),
             max_commit_history=config_data.get("ai", {}).get("max_commit_history"),
+            second_pass_enabled=config_data.get("ai", {}).get(
+                "second_pass_enabled", True
+            ),
+            second_pass_min_hunks=config_data.get("ai", {}).get(
+                "second_pass_min_hunks", 20
+            ),
+            second_pass_min_ratio=config_data.get("ai", {}).get(
+                "second_pass_min_ratio", 0.15
+            ),
         )
 
         # Load hunk configuration
@@ -131,7 +143,7 @@ class ConfigManager:
         # Load attribution configuration
         attribution_config_data = config_data.get("attribution", {})
         attribution_config = AttributionConfig(
-            enabled=attribution_config_data.get("enabled", True)
+            enabled=attribution_config_data.get("enabled", False)
         )
 
         # Load auto-apply setting
@@ -159,13 +171,16 @@ class ConfigManager:
                 "max_commit_context": 20,
                 "include_commit_history": True,
                 "max_commit_history": None,
+                "second_pass_enabled": True,
+                "second_pass_min_hunks": 20,
+                "second_pass_min_ratio": 0.15,
             },
             "hunks": {
                 "show_hunk_context": True,
                 "context_lines": 8,
                 "max_hunks_per_prompt": None,
             },
-            "attribution": {"enabled": True},
+            "attribution": {"enabled": False},
             "auto_apply": False,
             "base": "main",
         }

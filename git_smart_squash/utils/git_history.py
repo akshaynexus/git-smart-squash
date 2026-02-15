@@ -43,6 +43,20 @@ def get_commit_history(
             check=True,
         ).stdout
 
+        shortstat = subprocess.run(
+            ["git", "show", "--shortstat", "--format=", commit_hash],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        diffstat = subprocess.run(
+            ["git", "show", "--stat", "--format=", commit_hash],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
         files = [line.strip() for line in files_output.splitlines() if line.strip()]
 
         commits.append(
@@ -51,6 +65,8 @@ def get_commit_history(
                 "subject": subject,
                 "body": body,
                 "files": files,
+                "shortstat": shortstat,
+                "diffstat": diffstat,
             }
         )
 

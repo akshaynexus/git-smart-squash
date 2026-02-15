@@ -245,6 +245,32 @@ class GitSmartSquashCLI:
                 if isinstance(commit_plan, list)
                 else commit_plan.get("commits", [])
             )
+            normalized_commits, stats = normalize_commit_plan(
+                commits_list, hunks, add_catch_all=False
+            )
+
+            if self._should_run_second_pass(stats):
+                self.console.print(
+                    "[yellow]Large unassigned set detected. Running second-pass grouping...[/yellow]"
+                )
+                missing_hunk_ids = stats.get("missing_hunks", [])
+                missing_hunks = [h for h in hunks if h.id in set(missing_hunk_ids)]
+                second_pass = self.analyze_with_ai(
+                    missing_hunks,
+                    full_diff,
+                    self._build_second_pass_instructions(custom_instructions),
+                    compare_info,
+                    commit_history,
+                )
+                second_commits = (
+                    second_pass
+                    if isinstance(second_pass, list)
+                    else (second_pass or {}).get("commits", [])
+                )
+                commits_list = normalized_commits + (second_commits or [])
+            else:
+                commits_list = normalized_commits
+
             normalized_commits, stats = normalize_commit_plan(commits_list, hunks)
             commit_plan = normalized_commits
 
@@ -502,6 +528,29 @@ class GitSmartSquashCLI:
             self.console.print(
                 f"[yellow]Added {len(missing)} unassigned hunks to a final catch-all commit[/yellow]"
             )
+
+    def _should_run_second_pass(self, stats: Dict[str, Any]) -> bool:
+        if not self.config.ai.second_pass_enabled:
+            return False
+        total = int(stats.get("total_hunks", 0))
+        missing = stats.get("missing_hunks")
+        if not isinstance(missing, list) or not missing:
+            return False
+        ratio = (len(missing) / total) if total else 0
+        return (
+            len(missing) >= self.config.ai.second_pass_min_hunks
+            or ratio >= self.config.ai.second_pass_min_ratio
+        )
+
+    def _build_second_pass_instructions(self, base_instructions: Optional[str]) -> str:
+        extra = (
+            "Second pass: Only categorize the unassigned hunks below. "
+            "Do NOT reuse hunk IDs already assigned. "
+            "Prefer feat/fix with clear scope and PR-ready wording."
+        )
+        if base_instructions:
+            return f"{base_instructions}\n\n{extra}"
+        return extra
 
     def _display_commit_history_summary(
         self, commit_history: Optional[List[Dict[str, Any]]]
