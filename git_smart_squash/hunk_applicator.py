@@ -51,7 +51,11 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
         from .ai.providers.simple_unified import UnifiedAIProvider
         from .simple_config import ConfigManager, Config
         
-        logger.hunk_debug(f"Using AI to resolve conflict for hunk {hunk.id}")
+        if config is None:
+            config = ConfigManager().load_config()
+            logger.hunk_debug(f"No config provided, loaded fresh config: provider={config.ai.provider}, model={config.ai.model}")
+        
+        logger.hunk_debug(f"Using AI ({config.ai.provider}/{config.ai.model}) to resolve conflict for hunk {hunk.id}")
         
         file_path = hunk.file_path
         if not os.path.exists(file_path):
@@ -60,9 +64,6 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
         
         with open(file_path, 'r', encoding='utf-8') as f:
             current_content = f.read()
-        
-        if config is None:
-            config = ConfigManager().load_config()
         
         ai_provider = UnifiedAIProvider(config)
         
@@ -424,7 +425,7 @@ def _apply_dependency_group_atomically(hunks: List[Hunk], base_diff: str) -> boo
         if not success:
             logger.hunk_debug("Atomic application failed, trying hunks individually with intelligent resolution...")
             for hunk in hunks:
-                hunk_success = _intelligent_apply_hunk(hunk, base_diff)
+                hunk_success = _intelligent_apply_hunk(hunk, base_diff, _current_config)
                 if not hunk_success:
                     logger.warning(f"Failed to apply hunk {hunk.id} even with intelligent resolution")
                     return False

@@ -150,6 +150,7 @@ def _apply_commits_with_backup(cli, commit_plan, hunks, full_diff: str, base_bra
                             cli.logger.info(f"Failed to apply hunks for commit '{commit['message']}'")
                         except Exception:
                             pass
+                        cli_reset_staging_area()
                 else:
                     _emit_and_buffer(
                         cli,
