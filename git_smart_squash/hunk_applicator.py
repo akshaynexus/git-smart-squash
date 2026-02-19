@@ -223,58 +223,90 @@ def _call_ai_with_tools(ai_provider, prompt: str, tools: List[Dict]) -> Dict:
     """Call AI with tool calling capability."""
     import json
     
-    # Try OpenAI-style tool calling first
-    try:
-        response = ai_provider.client.chat.completions.create(
-            model=ai_provider.config.ai.model,
-            messages=[{"role": "user", "content": prompt}],
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.1,
-        )
+    provider = ai_provider.config.ai.provider.lower()
+    
+    # Create appropriate client based on provider
+    if provider in ("openai", "openrouter"):
+        import openai
+        api_key = os.getenv("OPENROUTER_API_KEY") if provider == "openrouter" else os.getenv("OPENAI_API_KEY")
+        base_url = "https://openrouter.ai/api/v1" if provider == "openrouter" else None
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
         
-        # Handle tool calls
-        for tool_call in response.choices[0].message.tool_calls:
-            func = tool_call.function
-            args = json.loads(func.arguments)
-            
-            if func.name == "get_conflict":
-                conflict = get_current_conflict()
-                return {"success": True, "conflict": conflict}
-            
-            elif func.name == "read_file":
-                path = args.get("path", "")
-                start = args.get("start_line", 1)
-                end = args.get("end_line")
-                with open(path, 'r') as f:
-                    lines = f.readlines()
-                content = ''.join(lines[start-1:end] if end else lines[start-1:])
-                return {"success": True, "file_content": content}
-            
-            elif func.name == "write_file":
-                path = args.get("path", "")
-                content = args.get("content", "")
-                with open(path, 'w') as f:
-                    f.write(content)
-                return {"success": True, "written": path}
-            
-            elif func.name == "git_stage":
-                import subprocess
-                path = args.get("file_path", "")
-                subprocess.run(['git', 'add', path], check=True)
-                return {"success": True, "staged": path}
+        # Convert tools to OpenAI format
+        openai_tools = []
+        for t in tools:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["function"]["name"],
+                    "description": t["function"]["description"],
+                    "parameters": t["function"]["parameters"]
+                }
+            })
         
-        # If no tool calls, check response content
-        return {"success": True, "response": response.choices[0].message.content}
-        
-    except Exception as e:
-        # Try Anthropic style
         try:
-            client = ai_provider.client
+            response = client.chat.completions.create(
+                model=ai_provider.config.ai.model,
+                messages=[{"role": "user", "content": prompt}],
+                tools=openai_tools,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+            
+            # Handle tool calls
+            for tool_call in response.choices[0].message.tool_calls:
+                func = tool_call.function
+                args = json.loads(func.arguments)
+                
+                if func.name == "get_conflict":
+                    conflict = get_current_conflict()
+                    return {"success": True, "conflict": conflict}
+                
+                elif func.name == "read_file":
+                    path = args.get("path", "")
+                    start = args.get("start_line", 1)
+                    end = args.get("end_line")
+                    with open(path, 'r') as f:
+                        lines = f.readlines()
+                    content = ''.join(lines[start-1:end] if end else lines[start-1:])
+                    return {"success": True, "file_content": content}
+                
+                elif func.name == "write_file":
+                    path = args.get("path", "")
+                    content = args.get("content", "")
+                    with open(path, 'w') as f:
+                        f.write(content)
+                    return {"success": True, "written": path}
+                
+                elif func.name == "git_stage":
+                    import subprocess
+                    path = args.get("file_path", "")
+                    subprocess.run(['git', 'add', path], check=True)
+                    return {"success": True, "staged": path}
+            
+            return {"success": True, "response": response.choices[0].message.content}
+            
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    elif provider == "anthropic":
+        import anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        client = anthropic.Anthropic(api_key=api_key)
+        
+        try:
+            anthropic_tools = []
+            for t in tools:
+                anthropic_tools.append({
+                    "name": t["function"]["name"],
+                    "description": t["function"]["description"],
+                    "input_schema": t["function"]["parameters"]
+                })
+            
             response = client.messages.create(
                 model=ai_provider.config.ai.model,
                 max_tokens=4000,
-                tools=[{"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]} for t in tools],
+                tools=anthropic_tools,
                 messages=[{"role": "user", "content": prompt}]
             )
             
@@ -303,8 +335,11 @@ def _call_ai_with_tools(ai_provider, prompt: str, tools: List[Dict]) -> Dict:
             
             return {"success": True, "response": str(response.content)}
             
-        except Exception as e2:
-            return {"success": False, "error": f"Tool calling failed: {e}, {e2}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    else:
+        return {"success": False, "error": f"Provider {provider} not supported for tool calling"}
 
 
 def _resolve_hunk_simple(hunk: Hunk, current_content: str, additions: List[str], file_path: str) -> bool:
@@ -333,83 +368,6 @@ def _resolve_hunk_simple(hunk: Hunk, current_content: str, additions: List[str],
     except Exception as e:
         logger.error(f"Simple fallback also failed: {e}")
         return False
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            current_content = f.read()
-        
-        ai_provider = UnifiedAIProvider(config)
-        
-        conflict_resolution_prompt = f"""You are a git hunk conflict resolver. A hunk failed to apply due to context mismatch.
-
-FILE: {file_path}
-
-CURRENT FILE CONTENT (entire file - {len(current_content)} chars):
-```
-{current_content}
-```
-
-FAILING HUNK:
-```
-{hunk.content}
-```
-
-ERROR: {error_context}
-
-Analyze the conflict and provide a JSON solution. The file has been modified since the diff was generated. 
-
-The hunk is trying to add/modify code but the line numbers no longer match. Look at the CURRENT FILE CONTENT to find where this code should go - find similar patterns, functions, or code blocks that match the hunk's intent.
-
-Provide your response as JSON with this exact structure:
-{{
-  "resolution_type": "apply_at_location" | "modify_hunk" | "skip",
-  "reasoning": "Explain why you chose this approach",
-  "apply_at_line": <line number> (if resolution_type is apply_at_location),
-  "modified_hunk": "If resolution_type is modify_hunk, provide the corrected hunk content with proper line numbers",
-  "success": true/false
-}}
-
-Analyze the current file to find where the changes should actually go, considering:
-1. The hunk's intent (what changes it's trying to make)
-2. Where similar code patterns exist in the current file
-3. Line number adjustments needed due to previous commits
-"""
-        
-        response = ai_provider.generate(conflict_resolution_prompt)
-        
-        logger.info(f"AI response for {hunk.id}: {response[:500]}...")
-        
-        if not response or not response.strip():
-            logger.warning("AI returned empty response for conflict resolution")
-            return False
-        
-        try:
-            solution = json.loads(response)
-        except json.JSONDecodeError as je:
-            logger.error(f"AI returned invalid JSON: {response[:1000]}")
-            logger.error(f"JSON parse error: {je}")
-            return False
-        
-        if not solution.get("success", False):
-            logger.warning(f"AI could not resolve conflict: {solution.get('reasoning', 'unknown')}")
-            return False
-        
-        resolution_type = solution.get("resolution_type", "skip")
-        
-        if resolution_type == "apply_at_location":
-            line_num = solution.get("apply_at_line")
-            if line_num:
-                logger.info(f"AI suggests applying at line {line_num}")
-                return _apply_hunk_at_location(hunk, line_num, base_diff)
-        
-        elif resolution_type == "modify_hunk":
-            modified_hunk = solution.get("modified_hunk")
-            if modified_hunk:
-                logger.info("AI provided modified hunk, applying...")
-                return _apply_modified_hunk(hunk, modified_hunk, base_diff)
-        
-        logger.hunk_debug(f"AI resolution type '{resolution_type}' not implementable")
-        return False
-
 
 def _apply_modified_hunk(hunk: Hunk, modified_content: str, base_diff: str = "") -> bool:
     """
