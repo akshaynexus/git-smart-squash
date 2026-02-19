@@ -391,21 +391,32 @@ class GitSmartSquashCLI:
     ):
         """Send hunks to AI and get back commit organization plan (as a list)."""
         try:
-            # Ensure config is loaded
+            if not hunks:
+                self.console.print("[red]No hunks to analyze. Aborting.[/red]")
+                return None
+
             if self.config is None:
                 self.config = self.config_manager.load_config()
 
             ai_provider = UnifiedAIProvider(self.config)
 
-            # Build hunk-based prompt
             prompt = self._build_hunk_prompt(
                 hunks, custom_instructions, compare_info, commit_history
             )
 
             cached = self._maybe_use_saved_response("hunk-plan")
-            response = cached if cached is not None else ai_provider.generate(prompt)
+            if cached is not None:
+                response = cached
+            else:
+                self.console.print("[dim]Calling AI provider...[/dim]")
+                response = ai_provider.generate(prompt)
 
-            # With structured output, response should be valid JSON
+            if not response or not response.strip():
+                self.console.print(
+                    "[red]AI returned empty response. Please check your API key and try again.[/red]"
+                )
+                return None
+
             result = json.loads(response)
 
             self.logger.debug(f"AI response type: {type(result).__name__}")
@@ -413,7 +424,6 @@ class GitSmartSquashCLI:
                 f"AI response: {json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)}"
             )
 
-            # Normalize to list of commits
             if (
                 isinstance(result, dict)
                 and "commits" in result
@@ -429,10 +439,17 @@ class GitSmartSquashCLI:
 
         except json.JSONDecodeError as e:
             self.console.print(f"[red]AI returned invalid JSON: {e}[/red]")
-            self._save_ai_response("hunk-plan", response)
+            if 'response' in locals() and response:
+                self._save_ai_response("hunk-plan", response)
             return None
         except Exception as e:
-            self.console.print(f"[red]AI analysis failed: {e}[/red]")
+            error_msg = str(e)
+            if "API key" in error_msg.lower() or "auth" in error_msg.lower():
+                self.console.print(f"[red]Authentication error: {e}[/red]")
+            elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                self.console.print(f"[red]AI request timed out. Please try again or use a different provider.[/red]")
+            else:
+                self.console.print(f"[red]AI analysis failed: {e}[/red]")
             return None
 
     def _build_hunk_prompt(
@@ -610,11 +627,18 @@ class GitSmartSquashCLI:
         prompt = build_commit_grouping_prompt(commit_history)
         ai_provider = UnifiedAIProvider(self.config)
         cached = self._maybe_use_saved_response("commit-grouping")
-        response = (
-            cached
-            if cached is not None
-            else ai_provider.generate_with_schema(prompt, COMMIT_GROUP_SCHEMA)
-        )
+        if cached is not None:
+            response = cached
+        else:
+            self.console.print("[dim]Grouping commits with AI...[/dim]")
+            response = ai_provider.generate_with_schema(prompt, COMMIT_GROUP_SCHEMA)
+
+        if not response or not response.strip():
+            self.console.print(
+                "[red]AI returned empty response for commit grouping. Please check your API key and try again.[/red]"
+            )
+            return None
+
         try:
             result = json.loads(response)
         except json.JSONDecodeError as e:
@@ -726,19 +750,26 @@ class GitSmartSquashCLI:
             prompt = build_hunk_assignment_prompt(groups, unassigned)
             ai_provider = UnifiedAIProvider(self.config)
             cached = self._maybe_use_saved_response("hunk-assignment")
-            response = (
-                cached
-                if cached is not None
-                else ai_provider.generate_with_schema(prompt, HUNK_ASSIGNMENT_SCHEMA)
-            )
-            try:
-                result = json.loads(response)
-            except json.JSONDecodeError as e:
+            if cached is not None:
+                response = cached
+            else:
+                self.console.print("[dim]Assigning hunks to groups...[/dim]")
+                response = ai_provider.generate_with_schema(prompt, HUNK_ASSIGNMENT_SCHEMA)
+
+            if not response or not response.strip():
                 self.console.print(
-                    f"[red]AI returned invalid JSON for hunk assignment: {e}[/red]"
+                    "[red]AI returned empty response for hunk assignment. Skipping AI assignment.[/red]"
                 )
-                self._save_ai_response("hunk-assignment", response)
                 result = None
+            else:
+                try:
+                    result = json.loads(response)
+                except json.JSONDecodeError as e:
+                    self.console.print(
+                        f"[red]AI returned invalid JSON for hunk assignment: {e}[/red]"
+                    )
+                    self._save_ai_response("hunk-assignment", response)
+                    result = None
             if isinstance(result, dict):
                 for assignment in result.get("assignments", []):
                     if not isinstance(assignment, dict):
@@ -824,11 +855,18 @@ class GitSmartSquashCLI:
         prompt = build_cluster_label_prompt(summaries, groups)
         ai_provider = UnifiedAIProvider(self.config)
         cached = self._maybe_use_saved_response("cluster-labels")
-        response = (
-            cached
-            if cached is not None
-            else ai_provider.generate_with_schema(prompt, CLUSTER_LABEL_SCHEMA)
-        )
+        if cached is not None:
+            response = cached
+        else:
+            self.console.print("[dim]Labeling clusters with AI...[/dim]")
+            response = ai_provider.generate_with_schema(prompt, CLUSTER_LABEL_SCHEMA)
+
+        if not response or not response.strip():
+            self.console.print(
+                "[red]AI returned empty response for cluster labels. Skipping AI labeling.[/red]"
+            )
+            return None
+
         try:
             result = json.loads(response)
         except json.JSONDecodeError as e:
@@ -859,13 +897,22 @@ class GitSmartSquashCLI:
         self.console.print(
             f"[yellow]Found saved AI response for {stage}: {saved_path}[/yellow]"
         )
+        try:
+            with open(saved_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            self.console.print(f"[red]Failed to read saved response: {e}[/red]")
+            return None
+
+        if not content or not content.strip():
+            self.console.print(
+                f"[red]Saved AI response for {stage} is empty. Re-running AI analysis...[/red]"
+            )
+            return None
+
         use_saved = input("Use this saved response instead of calling AI? (y/N): ")
         if use_saved.lower().strip() == "y":
-            try:
-                with open(saved_path, "r", encoding="utf-8") as f:
-                    return f.read()
-            except Exception as e:
-                self.console.print(f"[red]Failed to read saved response: {e}[/red]")
+            return content
         return None
 
     def _get_latest_saved_response(self, stage: str) -> Optional[str]:
