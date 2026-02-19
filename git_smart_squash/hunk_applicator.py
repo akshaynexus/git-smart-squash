@@ -71,9 +71,9 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
 
 FILE: {file_path}
 
-CURRENT FILE CONTENT (first 200 lines):
+CURRENT FILE CONTENT (entire file):
 ```
-{chr(10).join(current_content.split(chr(10))[:200])}
+{current_content}
 ```
 
 FAILING HUNK:
@@ -84,6 +84,8 @@ FAILING HUNK:
 ERROR: {error_context}
 
 Analyze the conflict and provide a JSON solution. The file has been modified since the diff was generated. 
+
+The hunk is trying to add/modify code but the line numbers no longer match. Look at the CURRENT FILE CONTENT to find where this code should go - find similar patterns, functions, or code blocks that match the hunk's intent.
 
 Provide your response as JSON with this exact structure:
 {{
@@ -108,8 +110,9 @@ Analyze the current file to find where the changes should actually go, consideri
         
         try:
             solution = json.loads(response)
-        except json.JSONDecodeError:
-            logger.error(f"AI returned invalid JSON: {response[:500]}")
+        except json.JSONDecodeError as je:
+            logger.error(f"AI returned invalid JSON: {response[:1000]}")
+            logger.error(f"JSON parse error: {je}")
             return False
         
         if not solution.get("success", False):
@@ -138,6 +141,8 @@ Analyze the current file to find where the changes should actually go, consideri
         return False
     except Exception as e:
         logger.error(f"Error in AI conflict resolution: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 
