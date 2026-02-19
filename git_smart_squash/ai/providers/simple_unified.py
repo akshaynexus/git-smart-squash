@@ -501,7 +501,7 @@ class UnifiedAIProvider:
 
         except ImportError:
             raise Exception("OpenAI library not installed. Run: pip install openai")
-        except openai.APIAuthenticationError as e:
+        except openai.AuthenticationError as e:
             raise Exception(
                 f"OpenRouter authentication failed: Invalid API key. "
                 f"Please ensure OPENROUTER_API_KEY is set correctly. "
