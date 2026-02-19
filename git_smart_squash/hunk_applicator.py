@@ -3,11 +3,14 @@ Hunk applicator module for applying specific hunks to the git staging area.
 """
 
 import os
+import re
+import json
 import subprocess
 import tempfile
 from typing import List, Dict, Optional, Tuple, Set
 from .diff_parser import Hunk, validate_hunk_combination, create_dependency_groups
 from .logger import get_logger
+from .simple_config import ConfigManager
 
 logger = get_logger()
 
@@ -18,6 +21,267 @@ file_modification_history = {}
 class HunkApplicatorError(Exception):
     """Custom exception for hunk application errors."""
     pass
+
+
+def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: str) -> bool:
+    """
+    Use AI to intelligently resolve hunk application conflicts.
+    
+    When a hunk fails to apply, this function:
+    1. Extracts the current file content and the failing hunk
+    2. Sends to AI to understand the conflict and generate a resolution
+    3. Applies the AI-suggested fix
+    
+    Args:
+        hunk: The hunk that failed to apply
+        base_diff: Original full diff
+        error_context: Error message from failed application
+        
+    Returns:
+        True if AI successfully resolved and applied the hunk, False otherwise
+    """
+    try:
+        from .ai.providers.simple_unified import UnifiedAIProvider
+        from .simple_config import ConfigManager
+        
+        logger.hunk_debug(f"Using AI to resolve conflict for hunk {hunk.id}")
+        
+        file_path = hunk.file_path
+        if not os.path.exists(file_path):
+            logger.error(f"File does not exist: {file_path}")
+            return False
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            current_content = f.read()
+        
+        config = ConfigManager().load_config()
+        ai_provider = UnifiedAIProvider(config)
+        
+        conflict_resolution_prompt = f"""You are a git hunk conflict resolver. A hunk failed to apply due to context mismatch.
+
+FILE: {file_path}
+
+CURRENT FILE CONTENT (first 200 lines):
+```
+{chr(10).join(current_content.split(chr(10))[:200])}
+```
+
+FAILING HUNK:
+```
+{hunk.content}
+```
+
+ERROR: {error_context}
+
+Analyze the conflict and provide a JSON solution. The file has been modified since the diff was generated. 
+
+Provide your response as JSON with this exact structure:
+{{
+  "resolution_type": "apply_at_location" | "modify_hunk" | "skip",
+  "reasoning": "Explain why you chose this approach",
+  "apply_at_line": <line number> (if resolution_type is apply_at_location),
+  "modified_hunk": "If resolution_type is modify_hunk, provide the corrected hunk content with proper line numbers",
+  "success": true/false
+}}
+
+Analyze the current file to find where the changes should actually go, considering:
+1. The hunk's intent (what changes it's trying to make)
+2. Where similar code patterns exist in the current file
+3. Line number adjustments needed due to previous commits
+"""
+        
+        response = ai_provider.generate(conflict_resolution_prompt)
+        
+        if not response or not response.strip():
+            logger.warning("AI returned empty response for conflict resolution")
+            return False
+        
+        try:
+            solution = json.loads(response)
+        except json.JSONDecodeError:
+            logger.error(f"AI returned invalid JSON: {response[:500]}")
+            return False
+        
+        if not solution.get("success", False):
+            logger.hunk_debug(f"AI could not resolve conflict: {solution.get('reasoning', 'unknown')}")
+            return False
+        
+        resolution_type = solution.get("resolution_type", "skip")
+        
+        if resolution_type == "apply_at_location":
+            line_num = solution.get("apply_at_line")
+            if line_num:
+                logger.hunk_debug(f"AI suggests applying at line {line_num}")
+                return _apply_hunk_at_location(hunk, line_num, base_diff)
+        
+        elif resolution_type == "modify_hunk":
+            modified_hunk = solution.get("modified_hunk")
+            if modified_hunk:
+                logger.hunk_debug(f"AI provided modified hunk, applying...")
+                return _apply_modified_hunk(hunk, modified_hunk)
+        
+        logger.hunk_debug(f"AI resolution type '{resolution_type}' not implementable")
+        return False
+        
+    except ImportError as e:
+        logger.error(f"AI provider not available: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in AI conflict resolution: {e}")
+        return False
+
+
+def _apply_modified_hunk(hunk: Hunk, modified_content: str) -> bool:
+    """
+    Apply a modified hunk content directly.
+    
+    Args:
+        hunk: Original hunk
+        modified_content: AI-modified hunk content
+        
+    Returns:
+        True if successfully applied
+    """
+    try:
+        patch_content = f"diff --git a/{hunk.file_path} b/{hunk.file_path}\n"
+        patch_content += f"--- a/{hunk.file_path}\n"
+        patch_content += f"+++ b/{hunk.file_path}\n"
+        patch_content += modified_content
+        
+        return _apply_patch_with_git(patch_content)
+    except Exception as e:
+        logger.error(f"Error applying modified hunk: {e}")
+        return False
+
+
+def _intelligent_apply_hunk(hunk: Hunk, base_diff: str) -> bool:
+    """
+    Intelligently apply a hunk by using AI to resolve conflicts.
+    
+    Args:
+        hunk: The hunk to apply
+        base_diff: Original full diff for context
+        
+    Returns:
+        True if successfully applied, False otherwise
+    """
+    try:
+        file_path = hunk.file_path
+        if not os.path.exists(file_path):
+            logger.error(f"File does not exist: {file_path}")
+            return False
+        
+        logger.hunk_debug(f"Attempting AI-powered conflict resolution for {hunk.id}")
+        
+        error_context = "Hunk context mismatch - file has been modified since diff was generated"
+        
+        return _resolve_hunk_conflict_with_ai(hunk, base_diff, error_context)
+        
+    except Exception as e:
+        logger.error(f"Error in intelligent hunk application: {e}")
+        return False
+
+
+def _find_best_match_location(
+    current_lines: List[str], 
+    removed_lines: List[str], 
+    context_lines: List[str]
+) -> Optional[int]:
+    """
+    Find the best location in the file where the hunk could apply.
+    
+    Args:
+        current_lines: Lines in the current file
+        removed_lines: Lines being removed by the hunk
+        context_lines: Context lines from the hunk
+        
+    Returns:
+        Best line number to apply the hunk, or None if not found
+    """
+    if not removed_lines:
+        return None
+    
+    min_match_score = 3
+    
+    best_score = 0
+    best_location = None
+    
+    for i in range(len(current_lines) - len(removed_lines) + 1):
+        match_count = 0
+        
+        for j, removed_line in enumerate(removed_lines):
+            current_line = current_lines[i + j].strip()
+            if current_line == removed_line.strip():
+                match_count += 1
+        
+        if match_count > best_score and match_count >= min_match_score:
+            best_score = match_count
+            best_location = i + 1
+    
+    if best_location and best_score >= min_match_score:
+        logger.hunk_debug(f"Found match at line {best_location} with score {best_score}/{len(removed_lines)}")
+        return best_location
+    
+    return None
+
+
+def _apply_hunk_at_location(hunk: Hunk, new_line: int, base_diff: str) -> bool:
+    """
+    Apply a hunk at a specific line location by modifying the hunk content.
+    
+    Args:
+        hunk: The hunk to apply
+        new_line: The line number to apply at
+        base_diff: Original full diff
+        
+    Returns:
+        True if successfully applied, False otherwise
+    """
+    try:
+        hunk_content = hunk.content
+        
+        hunk_header_match = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', hunk_content)
+        if hunk_header_match:
+            old_start = int(hunk_header_match.group(1))
+            
+            offset = new_line - old_start
+            
+            lines = hunk_content.split('\n')
+            new_lines = []
+            for line in lines:
+                if line.startswith('@@'):
+                    parts = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
+                    if parts:
+                        old_start = int(parts.group(1))
+                        old_count = int(parts.group(2)) if parts.group(2) else 1
+                        new_start = int(parts.group(3))
+                        new_count = int(parts.group(4)) if parts.group(4) else 1
+                        
+                        new_start = old_start + offset
+                        if old_count != new_count:
+                            new_line_str = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+                        else:
+                            new_line_str = f"@@ -{old_start},{old_count} +{new_start} @@"
+                        new_lines.append(new_line_str)
+                        continue
+                new_lines.append(line)
+            
+            new_hunk_content = '\n'.join(new_lines)
+            
+            logger.hunk_debug(f"Modified hunk header for application at line {new_line}")
+            
+            patch_content = f"diff --git a/{hunk.file_path} b/{hunk.file_path}\n"
+            patch_content += f"--- a/{hunk.file_path}\n"
+            patch_content += f"+++ b/{hunk.file_path}\n"
+            patch_content += new_hunk_content
+            
+            return _apply_patch_with_git(patch_content)
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error applying hunk at location: {e}")
+        return False
 
 
 
@@ -140,7 +404,18 @@ def _apply_dependency_group_atomically(hunks: List[Hunk], base_diff: str) -> boo
             return False
 
         # Apply using git's native mechanism
-        return _apply_patch_with_git(patch_content)
+        success = _apply_patch_with_git(patch_content)
+        
+        if not success:
+            logger.hunk_debug("Atomic application failed, trying hunks individually with intelligent resolution...")
+            for hunk in hunks:
+                hunk_success = _intelligent_apply_hunk(hunk, base_diff)
+                if not hunk_success:
+                    logger.warning(f"Failed to apply hunk {hunk.id} even with intelligent resolution")
+                    return False
+            return True
+        
+        return True
 
     except Exception as e:
         logger.error(f"Error in atomic application: {e}")
@@ -747,7 +1022,16 @@ def _relocate_and_apply_hunk(hunk: Hunk, base_diff: str) -> bool:
             return False
 
         # Apply using git's native mechanism
-        return _apply_patch_with_git(patch_content)
+        success = _apply_patch_with_git(patch_content)
+        
+        if not success:
+            logger.hunk_debug(f"Standard apply failed for {hunk.id}, trying intelligent resolution...")
+            success = _intelligent_apply_hunk(hunk, base_diff)
+            
+            if success:
+                logger.hunk_debug(f"✓ Intelligently resolved and applied hunk {hunk.id}")
+        
+        return success
 
     except Exception as e:
         logger.error(f"Error applying hunk {hunk.id}: {e}")
