@@ -103,7 +103,7 @@ def _apply_commits_with_backup(cli, commit_plan, hunks, full_diff: str, base_bra
                 hunk_ids = commit.get('hunk_ids') or []
                 if hunk_ids:
                     cli_reset_staging_area()
-                    success = cli_apply_hunks_with_fallback(hunk_ids, hunks_by_id, full_diff)
+                    success = cli_apply_hunks_with_fallback(hunk_ids, hunks_by_id, full_diff, cli.config)
                     if success:
                         result = subprocess.run(['git', 'diff', '--cached', '--name-only'], capture_output=True, text=True)
                         if result.stdout.strip():
@@ -171,7 +171,7 @@ def _apply_commits_with_backup(cli, commit_plan, hunks, full_diff: str, base_bra
             progress.update(task, description="Creating final commit for remaining changes...")
             cli_reset_staging_area()
             try:
-                success = cli_apply_hunks_with_fallback(remaining_hunk_ids, hunks_by_id, full_diff)
+                success = cli_apply_hunks_with_fallback(remaining_hunk_ids, hunks_by_id, full_diff, cli.config)
                 if success:
                     result = subprocess.run(['git', 'diff', '--cached', '--name-only'], capture_output=True, text=True)
                     if result.stdout.strip():

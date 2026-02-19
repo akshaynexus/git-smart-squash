@@ -7,15 +7,21 @@ import re
 import json
 import subprocess
 import tempfile
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set, TYPE_CHECKING
 from .diff_parser import Hunk, validate_hunk_combination, create_dependency_groups
 from .logger import get_logger
-from .simple_config import ConfigManager
+from .simple_config import ConfigManager, Config
+
+if TYPE_CHECKING:
+    from .simple_config import Config
 
 logger = get_logger()
 
 # Global tracking of file modifications
 file_modification_history = {}
+
+# Global config for AI conflict resolution
+_current_config: Optional['Config'] = None
 
 
 class HunkApplicatorError(Exception):
@@ -23,7 +29,7 @@ class HunkApplicatorError(Exception):
     pass
 
 
-def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: str) -> bool:
+def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: str, config: Optional['Config'] = None) -> bool:
     """
     Use AI to intelligently resolve hunk application conflicts.
     
@@ -36,13 +42,14 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
         hunk: The hunk that failed to apply
         base_diff: Original full diff
         error_context: Error message from failed application
+        config: Configuration object (optional, will load from file if not provided)
         
     Returns:
         True if AI successfully resolved and applied the hunk, False otherwise
     """
     try:
         from .ai.providers.simple_unified import UnifiedAIProvider
-        from .simple_config import ConfigManager
+        from .simple_config import ConfigManager, Config
         
         logger.hunk_debug(f"Using AI to resolve conflict for hunk {hunk.id}")
         
@@ -54,7 +61,9 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
         with open(file_path, 'r', encoding='utf-8') as f:
             current_content = f.read()
         
-        config = ConfigManager().load_config()
+        if config is None:
+            config = ConfigManager().load_config()
+        
         ai_provider = UnifiedAIProvider(config)
         
         conflict_resolution_prompt = f"""You are a git hunk conflict resolver. A hunk failed to apply due to context mismatch.
@@ -154,17 +163,23 @@ def _apply_modified_hunk(hunk: Hunk, modified_content: str) -> bool:
         return False
 
 
-def _intelligent_apply_hunk(hunk: Hunk, base_diff: str) -> bool:
+def _intelligent_apply_hunk(hunk: Hunk, base_diff: str, config: Optional['Config'] = None) -> bool:
     """
     Intelligently apply a hunk by using AI to resolve conflicts.
     
     Args:
         hunk: The hunk to apply
         base_diff: Original full diff for context
+        config: Configuration object (optional, uses global if not provided)
         
     Returns:
         True if successfully applied, False otherwise
     """
+    global _current_config
+    
+    if config is None:
+        config = _current_config
+    
     try:
         file_path = hunk.file_path
         if not os.path.exists(file_path):
@@ -175,7 +190,7 @@ def _intelligent_apply_hunk(hunk: Hunk, base_diff: str) -> bool:
         
         error_context = "Hunk context mismatch - file has been modified since diff was generated"
         
-        return _resolve_hunk_conflict_with_ai(hunk, base_diff, error_context)
+        return _resolve_hunk_conflict_with_ai(hunk, base_diff, error_context, config)
         
     except Exception as e:
         logger.error(f"Error in intelligent hunk application: {e}")
@@ -1077,7 +1092,7 @@ def _parse_hunk_content(hunk: Hunk) -> Tuple[List[str], List[str], List[str]]:
 
 
 
-def apply_hunks_with_fallback(hunk_ids: List[str], hunks_by_id: Dict[str, Hunk], base_diff: str) -> bool:
+def apply_hunks_with_fallback(hunk_ids: List[str], hunks_by_id: Dict[str, Hunk], base_diff: str, config: Optional['Config'] = None) -> bool:
     """
     Apply hunks using the hunk-based approach with backup-aware error handling.
 
@@ -1085,10 +1100,14 @@ def apply_hunks_with_fallback(hunk_ids: List[str], hunks_by_id: Dict[str, Hunk],
         hunk_ids: List of hunk IDs to apply
         hunks_by_id: Dictionary mapping hunk IDs to Hunk objects
         base_diff: Original full diff output
+        config: Configuration object (optional, will use CLI config if available)
 
     Returns:
         True if successful, False otherwise (triggers backup restoration in CLI)
     """
+    global _current_config
+    _current_config = config
+    
     try:
         result = apply_hunks(hunk_ids, hunks_by_id, base_diff)
         if not result:
