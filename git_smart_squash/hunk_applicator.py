@@ -53,9 +53,9 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
         
         if config is None:
             config = ConfigManager().load_config()
-            logger.hunk_debug(f"No config provided, loaded fresh config: provider={config.ai.provider}, model={config.ai.model}")
+            logger.debug(f"No config provided, loaded fresh config: provider={config.ai.provider}, model={config.ai.model}")
         
-        logger.hunk_debug(f"Using AI ({config.ai.provider}/{config.ai.model}) to resolve conflict for hunk {hunk.id}")
+        logger.debug(f"Using AI ({config.ai.provider}/{config.ai.model}) to resolve conflict for hunk {hunk.id}")
         
         file_path = hunk.file_path
         if not os.path.exists(file_path):
@@ -131,7 +131,7 @@ Analyze the current file to find where the changes should actually go, consideri
             modified_hunk = solution.get("modified_hunk")
             if modified_hunk:
                 logger.hunk_debug(f"AI provided modified hunk, applying...")
-                return _apply_modified_hunk(hunk, modified_hunk)
+                return _apply_modified_hunk(hunk, modified_hunk, base_diff)
         
         logger.hunk_debug(f"AI resolution type '{resolution_type}' not implementable")
         return False
@@ -146,13 +146,14 @@ Analyze the current file to find where the changes should actually go, consideri
         return False
 
 
-def _apply_modified_hunk(hunk: Hunk, modified_content: str) -> bool:
+def _apply_modified_hunk(hunk: Hunk, modified_content: str, base_diff: str = "") -> bool:
     """
     Apply a modified hunk content directly.
     
     Args:
         hunk: Original hunk
         modified_content: AI-modified hunk content
+        base_diff: Original full diff for context
         
     Returns:
         True if successfully applied
@@ -163,7 +164,7 @@ def _apply_modified_hunk(hunk: Hunk, modified_content: str) -> bool:
         patch_content += f"+++ b/{hunk.file_path}\n"
         patch_content += modified_content
         
-        return _apply_patch_with_git(patch_content)
+        return _apply_patch_with_git(patch_content, hunks=[hunk], base_diff=base_diff)
     except Exception as e:
         logger.error(f"Error applying modified hunk: {e}")
         return False
@@ -192,7 +193,7 @@ def _intelligent_apply_hunk(hunk: Hunk, base_diff: str, config: Optional['Config
             logger.error(f"File does not exist: {file_path}")
             return False
         
-        logger.hunk_debug(f"Attempting AI-powered conflict resolution for {hunk.id}")
+        logger.debug(f"Attempting AI-powered conflict resolution for {hunk.id}")
         
         error_context = "Hunk context mismatch - file has been modified since diff was generated"
         
@@ -296,7 +297,7 @@ def _apply_hunk_at_location(hunk: Hunk, new_line: int, base_diff: str) -> bool:
             patch_content += f"+++ b/{hunk.file_path}\n"
             patch_content += new_hunk_content
             
-            return _apply_patch_with_git(patch_content)
+            return _apply_patch_with_git(patch_content, hunks=[hunk], base_diff=base_diff)
         
         return False
         
@@ -425,7 +426,7 @@ def _apply_dependency_group_atomically(hunks: List[Hunk], base_diff: str) -> boo
             return False
 
         # Apply using git's native mechanism
-        success = _apply_patch_with_git(patch_content)
+        success = _apply_patch_with_git(patch_content, hunks=hunks)
         
         if not success:
             logger.hunk_debug("Atomic application failed, trying hunks individually with intelligent resolution...")
@@ -625,12 +626,13 @@ def _sync_files_from_staging(file_paths: Set[str]) -> bool:
     return all_success
 
 
-def _apply_patch_with_git(patch_content: str) -> bool:
+def _apply_patch_with_git(patch_content: str, hunks: Optional[List[Hunk]] = None, base_diff: str = "") -> bool:
     """
     Apply a patch using git's native mechanism with improved file-specific sync.
 
     Args:
         patch_content: The patch content to apply
+        hunks: Optional list of hunks being applied (for AI resolution on failure)
 
     Returns:
         True if successfully applied, False otherwise
@@ -741,13 +743,33 @@ def _apply_patch_with_git(patch_content: str) -> bool:
                         _restore_working_dir_state(working_dir_state, affected_files)
                         return False
                 else:
-                    logger.error(f"Git apply --cached also failed: {result_cached.stderr}")
-                    logger.hunk_debug(f"Full error output: {result_cached.stdout}")
-                    logger.hunk_debug("Common reasons for patch failure:")
-                    logger.hunk_debug("  - Hunk context doesn't match current file state")
-                    logger.hunk_debug("  - File has been modified since diff was generated")
-                    logger.hunk_debug("  - Patch is trying to modify non-existent lines")
-                    logger.hunk_debug("  - Whitespace or line ending differences")
+                    error_msg = result_cached.stderr
+                    logger.error(f"Git apply --cached also failed: {error_msg}")
+                    logger.debug(f"Full error output: {result_cached.stdout}")
+                    
+                    # Check for special error cases
+                    if "already exists in index" in error_msg:
+                        logger.debug("File already exists in index - extracting affected file and trying AI resolution")
+                        
+                        # Extract which file(s) already exist
+                        import re
+                        existing_files = re.findall(r'(\S+\.\w+): already exists in index', error_msg)
+                        
+                        if existing_files and hunks:
+                            logger.debug(f"Conflicting files: {existing_files}")
+                            # Try to handle via AI resolution for these hunks
+                            for hunk in hunks:
+                                if any(ef in hunk.file_path for ef in existing_files):
+                                    logger.debug(f"Trying AI resolution for hunk {hunk.id} with conflicting file {hunk.file_path}")
+                                    if _intelligent_apply_hunk(hunk, base_diff, _current_config):
+                                        logger.debug(f"AI resolved conflict for {hunk.file_path}")
+                            return True  # At least tried AI resolution
+                    
+                    logger.debug("Common reasons for patch failure:")
+                    logger.debug("  - Hunk context doesn't match current file state")
+                    logger.debug("  - File has been modified since diff was generated")
+                    logger.debug("  - Patch is trying to modify non-existent lines")
+                    logger.debug("  - File already exists in staging area")
                     # CRITICAL FIX: Restore both staging and working directory states
                     _restore_staging_state(staging_state)
                     _restore_working_dir_state(working_dir_state, affected_files)
@@ -1043,7 +1065,7 @@ def _relocate_and_apply_hunk(hunk: Hunk, base_diff: str) -> bool:
             return False
 
         # Apply using git's native mechanism
-        success = _apply_patch_with_git(patch_content)
+        success = _apply_patch_with_git(patch_content, hunks=[hunk])
         
         if not success:
             logger.hunk_debug(f"Standard apply failed for {hunk.id}, trying intelligent resolution...")
