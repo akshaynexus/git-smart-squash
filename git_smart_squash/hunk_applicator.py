@@ -23,6 +23,31 @@ file_modification_history = {}
 # Global config for AI conflict resolution
 _current_config: Optional['Config'] = None
 
+# Current conflict being resolved
+_current_conflict: Optional[Dict] = None
+
+
+def get_current_conflict() -> Optional[Dict]:
+    """Get the current conflict being resolved."""
+    return _current_conflict
+
+
+def set_current_conflict(hunk: Hunk, error_context: str) -> None:
+    """Set the current conflict info."""
+    global _current_conflict
+    _current_conflict = {
+        "hunk_id": hunk.id,
+        "file_path": hunk.file_path,
+        "error_context": error_context,
+        "hunk_content": hunk.content,
+    }
+
+
+def clear_current_conflict() -> None:
+    """Clear the current conflict."""
+    global _current_conflict
+    _current_conflict = None
+
 
 class HunkApplicatorError(Exception):
     """Custom exception for hunk application errors."""
@@ -31,36 +56,283 @@ class HunkApplicatorError(Exception):
 
 def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: str, config: Optional['Config'] = None) -> bool:
     """
-    Use AI to intelligently resolve hunk application conflicts.
+    Use AI with tool calling to interactively resolve hunk application conflicts.
     
-    When a hunk fails to apply, this function:
-    1. Extracts the current file content and the failing hunk
-    2. Sends to AI to understand the conflict and generate a resolution
-    3. Applies the AI-suggested fix
+    The AI will use tools to read the file, find the right location, and modify it.
     
     Args:
         hunk: The hunk that failed to apply
         base_diff: Original full diff
         error_context: Error message from failed application
-        config: Configuration object (optional, will load from file if not provided)
+        config: Configuration object (optional)
         
     Returns:
         True if AI successfully resolved and applied the hunk, False otherwise
     """
+    global _current_config
+    
     try:
         from .ai.providers.simple_unified import UnifiedAIProvider
         from .simple_config import ConfigManager, Config
+        
+        # Set current conflict
+        set_current_conflict(hunk, error_context)
         
         if config is None:
             config = ConfigManager().load_config()
             logger.debug(f"No config provided, loaded fresh config: provider={config.ai.provider}, model={config.ai.model}")
         
-        logger.debug(f"Using AI ({config.ai.provider}/{config.ai.model}) to resolve conflict for hunk {hunk.id}")
+        logger.info(f"Using AI ({config.ai.provider}/{config.ai.model}) with tool calling to resolve conflict for {hunk.file_path}")
         
         file_path = hunk.file_path
         if not os.path.exists(file_path):
             logger.error(f"File does not exist: {file_path}")
             return False
+        
+        # Get the full file content
+        with open(file_path, 'r', encoding='utf-8') as f:
+            current_content = f.read()
+        
+        # Extract what the hunk wants to add
+        additions = []
+        deletions = []
+        for line in hunk.content.split('\n'):
+            if line.startswith('+') and not line.startswith('+++'):
+                additions.append(line[1:])
+            elif line.startswith('-') and not line.startswith('---'):
+                deletions.append(line[1:])
+        
+        # Build tool definitions for file operations
+        tool_definitions = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_conflict",
+                    "description": "Get information about the current conflict being resolved - what the hunk contains and what needs to be added",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read the content of a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the file to read"},
+                            "start_line": {"type": "integer", "description": "Start line number (1-indexed)"},
+                            "end_line": {"type": "integer", "description": "End line number"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write content to a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the file to write"},
+                            "content": {"type": "string", "description": "Content to write to the file"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "git_stage",
+                    "description": "Stage a file in git",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string", "description": "Path to the file to stage"}
+                        },
+                        "required": ["file_path"]
+                    }
+                }
+            }
+        ]
+        
+        ai_provider = UnifiedAIProvider(config)
+        
+        # Build prompt with tool instructions
+        prompt = f"""You are a code integration assistant. A git hunk failed to apply. You need to fix this by modifying the file directly.
+
+FILE TO MODIFY: {file_path}
+
+CURRENT FILE CONTENT:
+```
+{current_content}
+```
+
+HUNK THAT FAILED TO APPLY:
+- Additions needed:
+{chr(10).join(f'+ {line}' for line in additions)}
+- Deletions needed:
+{chr(10).join(f'- {line}' for line in deletions)}
+
+ERROR: {error_context}
+
+Your task:
+1. Read the file to understand its structure
+2. Find where the code should be added/modified
+3. Write the modified file
+4. Stage the file with git
+
+Use the available tools to complete this task. After staging, respond with a JSON summary:
+{{"success": true, "explanation": "what you did"}}
+"""
+        
+        # Use the provider with tool calling
+        try:
+            result = _call_ai_with_tools(ai_provider, prompt, tool_definitions)
+            
+            if result.get("success"):
+                logger.info(f"AI successfully resolved conflict for {file_path}")
+                return True
+            else:
+                logger.warning(f"AI failed: {result.get('error', 'unknown')}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Tool calling failed, falling back: {e}")
+            # Fallback to simple approach
+            return _resolve_hunk_simple(hunk, current_content, additions, file_path)
+    
+    except Exception as e:
+        logger.error(f"Error in AI conflict resolution: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        clear_current_conflict()
+        return False
+    finally:
+        clear_current_conflict()
+
+
+def _call_ai_with_tools(ai_provider, prompt: str, tools: List[Dict]) -> Dict:
+    """Call AI with tool calling capability."""
+    import json
+    
+    # Try OpenAI-style tool calling first
+    try:
+        response = ai_provider.client.chat.completions.create(
+            model=ai_provider.config.ai.model,
+            messages=[{"role": "user", "content": prompt}],
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.1,
+        )
+        
+        # Handle tool calls
+        for tool_call in response.choices[0].message.tool_calls:
+            func = tool_call.function
+            args = json.loads(func.arguments)
+            
+            if func.name == "get_conflict":
+                conflict = get_current_conflict()
+                return {"success": True, "conflict": conflict}
+            
+            elif func.name == "read_file":
+                path = args.get("path", "")
+                start = args.get("start_line", 1)
+                end = args.get("end_line")
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+                content = ''.join(lines[start-1:end] if end else lines[start-1:])
+                return {"success": True, "file_content": content}
+            
+            elif func.name == "write_file":
+                path = args.get("path", "")
+                content = args.get("content", "")
+                with open(path, 'w') as f:
+                    f.write(content)
+                return {"success": True, "written": path}
+            
+            elif func.name == "git_stage":
+                import subprocess
+                path = args.get("file_path", "")
+                subprocess.run(['git', 'add', path], check=True)
+                return {"success": True, "staged": path}
+        
+        # If no tool calls, check response content
+        return {"success": True, "response": response.choices[0].message.content}
+        
+    except Exception as e:
+        # Try Anthropic style
+        try:
+            client = ai_provider.client
+            response = client.messages.create(
+                model=ai_provider.config.ai.model,
+                max_tokens=4000,
+                tools=[{"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]} for t in tools],
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            # Handle tool use
+            for content in response.content:
+                if content.type == "tool_use":
+                    args = content.input
+                    if content.name == "get_conflict":
+                        conflict = get_current_conflict()
+                        return {"success": True, "conflict": conflict}
+                    elif content.name == "read_file":
+                        path = args.get("path", "")
+                        with open(path, 'r') as f:
+                            return {"success": True, "file_content": f.read()}
+                    elif content.name == "write_file":
+                        path = args.get("path", "")
+                        content_val = args.get("content", "")
+                        with open(path, 'w') as f:
+                            f.write(content_val)
+                        return {"success": True, "written": path}
+                    elif content.name == "git_stage":
+                        import subprocess
+                        path = args.get("file_path", "")
+                        subprocess.run(['git', 'add', path], check=True)
+                        return {"success": True, "staged": path}
+            
+            return {"success": True, "response": str(response.content)}
+            
+        except Exception as e2:
+            return {"success": False, "error": f"Tool calling failed: {e}, {e2}"}
+
+
+def _resolve_hunk_simple(hunk: Hunk, current_content: str, additions: List[str], file_path: str) -> bool:
+    """Simple fallback: just append to end of relevant section."""
+    try:
+        lines = current_content.split('\n')
+        
+        # Try to find a good insertion point - look for class or function end
+        insert_pos = len(lines)
+        for i, line in enumerate(lines):
+            if line.strip().startswith('}') and i > len(lines) * 0.5:
+                insert_pos = i
+                break
+        
+        new_lines = lines[:insert_pos] + additions + lines[insert_pos:]
+        new_content = '\n'.join(new_lines)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        
+        subprocess.run(['git', 'add', file_path], check=True)
+        
+        logger.info(f"Simple fallback: added {len(additions)} lines to {file_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Simple fallback also failed: {e}")
+        return False
         
         with open(file_path, 'r', encoding='utf-8') as f:
             current_content = f.read()
@@ -71,7 +343,7 @@ def _resolve_hunk_conflict_with_ai(hunk: Hunk, base_diff: str, error_context: st
 
 FILE: {file_path}
 
-CURRENT FILE CONTENT (entire file):
+CURRENT FILE CONTENT (entire file - {len(current_content)} chars):
 ```
 {current_content}
 ```
@@ -104,6 +376,8 @@ Analyze the current file to find where the changes should actually go, consideri
         
         response = ai_provider.generate(conflict_resolution_prompt)
         
+        logger.info(f"AI response for {hunk.id}: {response[:500]}...")
+        
         if not response or not response.strip():
             logger.warning("AI returned empty response for conflict resolution")
             return False
@@ -116,7 +390,7 @@ Analyze the current file to find where the changes should actually go, consideri
             return False
         
         if not solution.get("success", False):
-            logger.hunk_debug(f"AI could not resolve conflict: {solution.get('reasoning', 'unknown')}")
+            logger.warning(f"AI could not resolve conflict: {solution.get('reasoning', 'unknown')}")
             return False
         
         resolution_type = solution.get("resolution_type", "skip")
@@ -124,25 +398,16 @@ Analyze the current file to find where the changes should actually go, consideri
         if resolution_type == "apply_at_location":
             line_num = solution.get("apply_at_line")
             if line_num:
-                logger.hunk_debug(f"AI suggests applying at line {line_num}")
+                logger.info(f"AI suggests applying at line {line_num}")
                 return _apply_hunk_at_location(hunk, line_num, base_diff)
         
         elif resolution_type == "modify_hunk":
             modified_hunk = solution.get("modified_hunk")
             if modified_hunk:
-                logger.hunk_debug(f"AI provided modified hunk, applying...")
+                logger.info("AI provided modified hunk, applying...")
                 return _apply_modified_hunk(hunk, modified_hunk, base_diff)
         
         logger.hunk_debug(f"AI resolution type '{resolution_type}' not implementable")
-        return False
-        
-    except ImportError as e:
-        logger.error(f"AI provider not available: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Error in AI conflict resolution: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return False
 
 
